@@ -6,7 +6,10 @@ import sys
 import discord
 
 
-# Railway-Logs übersichtlich ausgeben
+# --------------------------------------------------
+# Logging für Railway
+# --------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
@@ -17,7 +20,10 @@ logging.basicConfig(
 logger = logging.getLogger("voicekeeper")
 
 
-# Umgebungsvariablen prüfen
+# --------------------------------------------------
+# Railway-Variablen prüfen
+# --------------------------------------------------
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 VOICE_CHANNEL_ID_RAW = os.getenv("VOICE_CHANNEL_ID")
 
@@ -35,9 +41,13 @@ try:
     VOICE_CHANNEL_ID = int(VOICE_CHANNEL_ID_RAW)
 except ValueError as error:
     raise RuntimeError(
-        "VOICE_CHANNEL_ID muss ausschließlich aus Zahlen bestehen."
+        "VOICE_CHANNEL_ID darf nur aus Zahlen bestehen."
     ) from error
 
+
+# --------------------------------------------------
+# Discord-Client
+# --------------------------------------------------
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -46,20 +56,30 @@ connection_task: asyncio.Task | None = None
 
 
 async def get_voice_channel() -> discord.VoiceChannel:
-    """Lädt den gewünschten Sprachkanal aus Discord."""
+    """
+    Sucht den gewünschten Sprachkanal.
+    Falls er nicht im Cache ist, wird er direkt von Discord geladen.
+    """
 
     channel = client.get_channel(VOICE_CHANNEL_ID)
 
     if channel is None:
         try:
             channel = await client.fetch_channel(VOICE_CHANNEL_ID)
+
         except discord.NotFound as error:
             raise RuntimeError(
                 f"Der Kanal mit der ID {VOICE_CHANNEL_ID} wurde nicht gefunden."
             ) from error
+
         except discord.Forbidden as error:
             raise RuntimeError(
                 "Der Bot darf den Sprachkanal nicht sehen."
+            ) from error
+
+        except discord.HTTPException as error:
+            raise RuntimeError(
+                "Der Sprachkanal konnte nicht von Discord geladen werden."
             ) from error
 
     if not isinstance(channel, discord.VoiceChannel):
@@ -70,56 +90,114 @@ async def get_voice_channel() -> discord.VoiceChannel:
     return channel
 
 
-async def disconnect_broken_clients() -> None:
-    """Entfernt alte oder nicht mehr verbundene Voice-Clients."""
+async def remove_broken_voice_client(
+    voice_client: discord.VoiceClient,
+) -> None:
+    """
+    Entfernt eine alte oder ungültige Voice-Sitzung vollständig.
+    Das hilft insbesondere nach Discord-Fehlern wie WebSocket 4006.
+    """
 
-    for voice_client in list(client.voice_clients):
-        if not voice_client.is_connected():
-            try:
-                await voice_client.disconnect(force=True)
-            except Exception:
-                logger.exception(
-                    "Ein alter Voice-Client konnte nicht bereinigt werden."
-                )
+    logger.warning(
+        "Alte oder ungültige Voice-Sitzung wird entfernt."
+    )
+
+    try:
+        await voice_client.disconnect(force=True)
+    except Exception:
+        logger.exception(
+            "Die alte Voice-Verbindung konnte nicht sauber getrennt werden."
+        )
+
+    try:
+        voice_client.cleanup()
+    except Exception:
+        logger.exception(
+            "Die alte Voice-Verbindung konnte nicht vollständig bereinigt werden."
+        )
+
+    # Discord kurz Zeit geben, die alte Sitzung zu verwerfen
+    await asyncio.sleep(3)
 
 
 async def maintain_voice_connection() -> None:
-    """Prüft dauerhaft, ob der Bot im richtigen Sprachkanal verbunden ist."""
+    """
+    Überwacht dauerhaft, ob der Bot im richtigen Sprachkanal verbunden ist.
+    """
 
     await client.wait_until_ready()
 
     while not client.is_closed():
         try:
             channel = await get_voice_channel()
-            await disconnect_broken_clients()
 
             voice_client = discord.utils.get(
                 client.voice_clients,
                 guild=channel.guild,
             )
 
-            if voice_client and voice_client.is_connected():
-                if voice_client.channel.id != channel.id:
+            # Bot ist verbunden
+            if voice_client is not None and voice_client.is_connected():
+                if voice_client.channel is None:
+                    logger.warning(
+                        "Voice-Client ist verbunden, hat aber keinen Kanal."
+                    )
+                    await remove_broken_voice_client(voice_client)
+
+                elif voice_client.channel.id != channel.id:
                     logger.warning(
                         "Bot befindet sich im falschen Sprachkanal. "
-                        "Er wird verschoben."
+                        "Er wird nach %s verschoben.",
+                        channel.name,
                     )
+
                     await voice_client.move_to(channel)
+
+                    logger.info(
+                        "Bot wurde erfolgreich nach %s verschoben.",
+                        channel.name,
+                    )
+
                 else:
                     logger.info(
-                        "Verbindung aktiv: %s | Latenz: %.0f ms",
+                        "Verbindung aktiv: %s | Voice-Latenz: %.0f ms",
                         channel.name,
                         voice_client.average_latency * 1000,
                     )
-            else:
+
+            # Voice-Client vorhanden, aber nicht verbunden
+            elif voice_client is not None:
+                await remove_broken_voice_client(voice_client)
+
                 logger.warning(
-                    "Keine Voice-Verbindung vorhanden. Verbinde neu mit %s.",
+                    "Defekte Voice-Sitzung wurde entfernt. "
+                    "Neue Verbindung zu %s wird aufgebaut.",
                     channel.name,
                 )
 
                 await channel.connect(
-                    reconnect=True,
                     timeout=30.0,
+                    reconnect=True,
+                    self_deaf=True,
+                    self_mute=True,
+                )
+
+                logger.info(
+                    "Erfolgreich neu mit %s verbunden.",
+                    channel.name,
+                )
+
+            # Noch gar kein Voice-Client vorhanden
+            else:
+                logger.warning(
+                    "Keine Voice-Verbindung vorhanden. "
+                    "Verbinde mit %s.",
+                    channel.name,
+                )
+
+                await channel.connect(
+                    timeout=30.0,
+                    reconnect=True,
                     self_deaf=True,
                     self_mute=True,
                 )
@@ -129,10 +207,11 @@ async def maintain_voice_connection() -> None:
                     channel.name,
                 )
 
-            # Alle zwei Minuten prüfen
-            await asyncio.sleep(120)
+            # Verbindung alle 60 Sekunden kontrollieren
+            await asyncio.sleep(60)
 
         except asyncio.CancelledError:
+            logger.info("Voice-Überwachung wurde beendet.")
             raise
 
         except discord.Forbidden:
@@ -145,15 +224,23 @@ async def maintain_voice_connection() -> None:
         except discord.ClientException:
             logger.exception(
                 "Discord meldet einen Voice-Verbindungsfehler. "
-                "Neuer Versuch in 30 Sekunden."
+                "Neuer Versuch in 15 Sekunden."
             )
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
+
+        except asyncio.TimeoutError:
+            logger.exception(
+                "Der Aufbau der Voice-Verbindung hat zu lange gedauert. "
+                "Neuer Versuch in 15 Sekunden."
+            )
+            await asyncio.sleep(15)
 
         except Exception:
             logger.exception(
-                "Unerwarteter Fehler. Neuer Versuch in 30 Sekunden."
+                "Unerwarteter Fehler in der Voice-Überwachung. "
+                "Neuer Versuch in 15 Sekunden."
             )
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
 
 @client.event
@@ -166,25 +253,40 @@ async def on_ready() -> None:
         client.user.id if client.user else "unbekannt",
     )
 
-    # on_ready kann nach einem Gateway-Reconnect erneut ausgelöst werden.
-    # Deshalb darf die Überwachungsaufgabe nur einmal gestartet werden.
+    # on_ready kann nach einem Reconnect mehrfach ausgelöst werden.
+    # Deshalb darf die Überwachung nur einmal laufen.
     if connection_task is None or connection_task.done():
         connection_task = asyncio.create_task(
             maintain_voice_connection(),
             name="voice-connection-monitor",
         )
-        logger.info("Voice-Verbindungsüberwachung gestartet.")
+
+        logger.info(
+            "Voice-Verbindungsüberwachung gestartet."
+        )
+    else:
+        logger.info(
+            "Voice-Verbindungsüberwachung läuft bereits."
+        )
 
 
 @client.event
 async def on_disconnect() -> None:
-    logger.warning("Discord-Gateway-Verbindung wurde unterbrochen.")
+    logger.warning(
+        "Discord-Gateway-Verbindung wurde unterbrochen."
+    )
 
 
 @client.event
 async def on_resumed() -> None:
-    logger.info("Discord-Gateway-Sitzung wurde erfolgreich fortgesetzt.")
+    logger.info(
+        "Discord-Gateway-Sitzung wurde erfolgreich fortgesetzt."
+    )
 
+
+# --------------------------------------------------
+# Bot starten
+# --------------------------------------------------
 
 try:
     client.run(
@@ -192,8 +294,10 @@ try:
         reconnect=True,
         log_handler=None,
     )
+
 except discord.LoginFailure:
     logger.critical(
-        "Der Discord-Token ist ungültig. Bitte DISCORD_TOKEN in Railway prüfen."
+        "Der Discord-Token ist ungültig. "
+        "Bitte DISCORD_TOKEN in Railway überprüfen."
     )
     raise
