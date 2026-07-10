@@ -1,2 +1,2 @@
-discord.py[voice]
+discord.py[voice]>=2.6.0
 PyNaCl
