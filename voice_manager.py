@@ -84,7 +84,7 @@ class VoiceManager:
 
             voice_client = await channel.connect(
                 timeout=45.0,
-                reconnect=True,
+                reconnect=False,
                 self_deaf=True,
                 self_mute=False,
             )
